@@ -47,7 +47,8 @@ private:
 };
 
 struct Axis {
-    Axis(SocketCanIntf* can_intf, uint32_t node_id) : can_intf_(can_intf), node_id_(node_id) {}
+    Axis(SocketCanIntf* can_intf, uint32_t node_id, double direction)
+        : can_intf_(can_intf), node_id_(node_id), direction_(direction) {}
 
     void on_can_msg(const rclcpp::Time& timestamp, const can_frame& frame);
 
@@ -55,6 +56,13 @@ struct Axis {
 
     SocketCanIntf* can_intf_;
     uint32_t node_id_;
+
+    // Sign applied to every command sent to and every estimate read from this
+    // axis (+1.0 normal, -1.0 inverted). Lets mirror-mounted wheels (e.g. the
+    // left side of a skid-steer rover) spin the correct way without re-wiring or
+    // re-calibrating the ODrive. Set per joint via a <param name="direction"> in
+    // the ros2_control URDF; defaults to 1.0 when omitted.
+    double direction_ = 1.0;
 
     // Commands (ros2_control => ODrives)
     double pos_setpoint_ = 0.0f; // [rad]
@@ -115,7 +123,13 @@ CallbackReturn ODriveHardwareInterface::on_init(const hardware_interface::Hardwa
     can_intf_name_ = info_.hardware_parameters["can"];
 
     for (auto& joint : info_.joints) {
-        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")));
+        // Optional per-joint direction sign (+1.0 default, -1.0 to invert).
+        double direction = 1.0;
+        auto dir_it = joint.parameters.find("direction");
+        if (dir_it != joint.parameters.end()) {
+            direction = std::stod(dir_it->second);
+        }
+        axes_.emplace_back(&can_intf_, std::stoi(joint.parameters.at("node_id")), direction);
     }
 
     return CallbackReturn::SUCCESS;
@@ -266,18 +280,18 @@ return_type ODriveHardwareInterface::write(const rclcpp::Time&, const rclcpp::Du
         // Send the CAN message that fits the set of enabled setpoints
         if (axis.pos_input_enabled_) {
             Set_Input_Pos_msg_t msg;
-            msg.Input_Pos = axis.pos_setpoint_ / (2 * M_PI);
-            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
-            msg.Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Pos = axis.direction_ * axis.pos_setpoint_ / (2 * M_PI);
+            msg.Vel_FF = axis.vel_input_enabled_ ? (axis.direction_ * axis.vel_setpoint_ / (2 * M_PI)) : 0.0f;
+            msg.Torque_FF = axis.torque_input_enabled_ ? (axis.direction_ * axis.torque_setpoint_) : 0.0f;
             axis.send(msg);
         } else if (axis.vel_input_enabled_) {
             Set_Input_Vel_msg_t msg;
-            msg.Input_Vel = axis.vel_setpoint_ / (2 * M_PI);
-            msg.Input_Torque_FF = axis.torque_input_enabled_ ? axis.torque_setpoint_ : 0.0f;
+            msg.Input_Vel = axis.direction_ * axis.vel_setpoint_ / (2 * M_PI);
+            msg.Input_Torque_FF = axis.torque_input_enabled_ ? (axis.direction_ * axis.torque_setpoint_) : 0.0f;
             axis.send(msg);
         } else if (axis.torque_input_enabled_) {
             Set_Input_Torque_msg_t msg;
-            msg.Input_Torque = axis.torque_setpoint_;
+            msg.Input_Torque = axis.direction_ * axis.torque_setpoint_;
             axis.send(msg);
         } else {
             // no control enabled - don't send any setpoint
@@ -348,14 +362,14 @@ void Axis::on_can_msg(const rclcpp::Time&, const can_frame& frame) {
     switch (cmd) {
         case Get_Encoder_Estimates_msg_t::cmd_id: {
             if (Get_Encoder_Estimates_msg_t msg; try_decode(msg)) {
-                pos_estimate_ = msg.Pos_Estimate * (2 * M_PI);
-                vel_estimate_ = msg.Vel_Estimate * (2 * M_PI);
+                pos_estimate_ = direction_ * msg.Pos_Estimate * (2 * M_PI);
+                vel_estimate_ = direction_ * msg.Vel_Estimate * (2 * M_PI);
             }
         } break;
         case Get_Torques_msg_t::cmd_id: {
             if (Get_Torques_msg_t msg; try_decode(msg)) {
-                torque_target_ = msg.Torque_Target;
-                torque_estimate_ = msg.Torque_Estimate;
+                torque_target_ = direction_ * msg.Torque_Target;
+                torque_estimate_ = direction_ * msg.Torque_Estimate;
             }
         } break;
             // silently ignore unimplemented command IDs
